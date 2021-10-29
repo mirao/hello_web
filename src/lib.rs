@@ -7,31 +7,53 @@ use chrono::Local;
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// Log with timestamp to display in raw mode
+pub fn log(message: String) {
+    let current_time = Local::now().format("%Y-%m-%d %H:%M:%S");
+
+    println!("{}: {}\r", current_time, message);
+}
+
 #[derive(Debug)]
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
         let thread = thread::spawn(move || {
             loop
             /* Loop is needed, otherwise receiver is dropped when thread finishes and next sending may fail */
             {
-                let job = receiver.lock().unwrap().recv().unwrap();
-                println!(
-                    "{:}: Worker {} got a job; executing.",
-                    Local::now().format("%Y-%m-%d %H:%M:%S"),
-                    id
-                );
+                let message = receiver.lock().unwrap().recv().unwrap();
 
-                job();
+                match message {
+                    Message::NewJob(job) => {
+                        log(format!("Worker {} got a job; executing.", id));
+
+                        job();
+                    }
+
+                    Message::Terminate => {
+                        log(format!("Worker {} was told to terminate.", id));
+
+                        break;
+                    }
+                }
             }
         });
 
-        Worker { id, thread }
+        Worker {
+            id,
+            thread: Some(thread),
+        }
     }
+}
+
+enum Message {
+    NewJob(Job),
+    Terminate,
 }
 
 #[derive(PartialEq, Debug)]
@@ -42,7 +64,7 @@ pub enum PoolCreationError {
 #[derive(Debug)]
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: mpsc::Sender<Message>,
 }
 
 impl ThreadPool {
@@ -73,7 +95,27 @@ impl ThreadPool {
     {
         let job = Box::new(f);
 
-        self.sender.send(job).unwrap();
+        self.sender.send(Message::NewJob(job)).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        log("Sending terminate message to all workers.".to_string());
+
+        for _ in &self.workers {
+            self.sender.send(Message::Terminate).unwrap();
+        }
+
+        log("Shutting down all workers.".to_string());
+
+        for worker in &mut self.workers {
+            log(format!("Shutting down worker {}", worker.id));
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 }
 

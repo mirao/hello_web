@@ -1,29 +1,62 @@
+use hello_web::log;
+use hello_web::ThreadPool;
+
 use std::fs;
+use std::io;
 use std::io::prelude::*;
+use std::io::stdout;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use hello_web::ThreadPool;
-
-const HTTP_HEADER: &str = "HTTP/1.1";
+use termion::event::Key;
+use termion::input::TermRead;
+use termion::raw::IntoRawMode;
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+    // Don't block processing of input (key press) when waiting for incoming connection
+    listener
+        .set_nonblocking(true)
+        .expect("Cannot set non-blocking");
+
+    // Web server in max 4 threads
     let pool = ThreadPool::new(4).unwrap();
 
-    for stream in listener.incoming() {
-        let stream = stream.unwrap();
+    println!("Press 'q' to shutdown web server");
+    let (send_key, recv_key) = mpsc::channel();
 
-        pool.execute(|| {
-            handle_connection(stream);
-        });
+    // Read key from input and send to channel
+    // Processing of input in thread doesn't block stdout, therefore workers can still log on screen
+    // Raw mode set for stdout requires '\r' in println! to get correct EOLN
+    let _stdout = stdout().into_raw_mode().unwrap();
+    thread::spawn(move || {
+        for key in io::stdin().keys() {
+            send_key.send(key.unwrap()).unwrap();
+        }
+    });
+
+    for stream in listener.incoming() {
+        if let Ok(s) = stream {
+            pool.execute(|| {
+                handle_connection(s);
+            });
+        }
+
+        // Receive pressed key from channel, 'q' means triggers shutdown of web server
+        if let Ok(key) = recv_key.try_recv() {
+            if key == Key::Char('q') {
+                break;
+            }
+        }
     }
+    log("Shutting down.".to_string());
 }
 
 fn starts_with(buffer: &[u8], method: &str) -> bool {
-    buffer.starts_with(format!("{} {}", method, HTTP_HEADER).as_bytes())
+    buffer.starts_with(format!("{} {}", method, "HTTP/1.1").as_bytes())
 }
 
 fn handle_connection(mut stream: TcpStream) {
